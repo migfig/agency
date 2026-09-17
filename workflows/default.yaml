@@ -1,0 +1,40 @@
+name: default
+entry_point: writer
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: Qwen3.5-4B-UD-Q6_K_XL.gguf
+    vram_size: 8GB
+
+nodes:
+  writer:
+    id: writer
+    type: agent
+    model: draft
+    system_prompt: You are a concise technical writer. Plain text only, no markdown.
+    prompt_template: >
+      Write exactly two sentences on why a model registry with pre-execution
+      validation matters for batch LLM runs.
+    temperature: 0.4
+  critic:
+    id: critic
+    type: agent
+    model: draft
+    system_prompt: You are a blunt editor. Be brief. Plain text only.
+    prompt_template: |
+      Below is a draft. Reply with a one-sentence verdict, then one concrete
+      improvement suggestion.
+
+      Draft:
+      {{ nodes.writer.output }}
+    temperature: 0.2
+edges:
+  - from_id: writer
+    to_id: critic
+phases:
+  - id: phase-1
+    name: Draft and review
+    node_ids:
+      - writer
+      - critic

@@ -1,0 +1,199 @@
+name: vendor-payment
+entry_point: invoice_parse
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: intake
+    name: Invoice Intake
+    node_ids: [invoice_parse]
+  - id: checks
+    name: Parallel Checks
+    node_ids: [checks_fanout, policy_check, duplicate_check, checks_merge]
+  - id: decision
+    name: Payment Decision
+    node_ids: [approval_gate, release_payment, hold_payment, payment_merge]
+  - id: signoff
+    name: Finance Sign-off
+    node_ids: [memo_header, finance_signoff]
+
+nodes:
+  # Phase: intake
+  invoice_parse:
+    id: invoice_parse
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: You are the AP clerk parsing vendor invoices.
+    prompt_template: |
+      Parse this invoice. Reply in exactly three lines:
+      1. "vendor: " followed by the vendor name
+      2. "amount: " followed by the total, keeping the exact format
+      3. "category: " followed by one of software, hardware, services, other
+
+      INVOICE INV-2026-0417 from CloudHarbor GmbH
+      Line 1: Dedicated inference capacity, 800 GPU-hours, $1,080.00
+      Line 2: Support tier 2, monthly, $160.00
+      Total due: $1,240.00
+      Terms: net 30
+    retry:
+      max_attempts: 3
+      base_delay_seconds: 0.5
+      max_delay_seconds: 5
+      timeout_seconds: 120
+
+  # Phase: checks
+  checks_fanout:
+    id: checks_fanout
+    type: broadcast
+    targets: [policy_check, duplicate_check]
+
+  policy_check:
+    id: policy_check
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: >
+      You are the AP policy auditor. Policy: single invoices over $1,000
+      require finance sign-off; software spend is an allowed category.
+    prompt_template: |
+      Check this parsed invoice against policy. Start your reply with
+      "PASS" or "FAIL: " (followed by the violated rule in one sentence).
+      One to two sentences total.
+
+      Parsed invoice:
+      {{ nodes.invoice_parse.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  duplicate_check:
+    id: duplicate_check
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: You are the AP duplicate-payment guard.
+    prompt_template: |
+      Check this parsed invoice against the recent payment register.
+      Start your reply with "PASS" or "FAIL: " (followed by the suspected
+      duplicate in one sentence). One to two sentences total.
+
+      Parsed invoice:
+      {{ nodes.invoice_parse.output }}
+
+      Recent payments:
+      INV-2026-0381 CloudHarbor GmbH $1,240.00 (paid 2026-08-02, GPU-hours Q3)
+      INV-2026-0402 DataRail Inc $220.00 (paid 2026-08-21, egress fees)
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  checks_merge:
+    id: checks_merge
+    type: merge
+    strategy: all
+    inputs: [policy_check, duplicate_check]
+
+  # Phase: decision
+  approval_gate:
+    id: approval_gate
+    type: conditional
+    condition: "{{ nodes.checks_merge.output }} not contains FAIL"
+    branches:
+      "true": release_payment
+      "false": hold_payment
+
+  release_payment:
+    id: release_payment
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the finance associate drafting a payment release memo.
+    prompt_template: |
+      Both checks passed. Draft the payment release memo: vendor, amount,
+      the checks performed, and the release recommendation. Under 80
+      words, plain text.
+
+      Parsed invoice:
+      {{ nodes.invoice_parse.output }}
+
+      Check results:
+      {{ nodes.checks_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  hold_payment:
+    id: hold_payment
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the finance associate drafting a payment hold memo.
+    prompt_template: |
+      A check failed. Draft the payment hold memo: vendor, amount, which
+      check failed and why, and the exact next step before the payment can
+      release. Under 80 words, plain text.
+
+      Parsed invoice:
+      {{ nodes.invoice_parse.output }}
+
+      Check results:
+      {{ nodes.checks_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  payment_merge:
+    id: payment_merge
+    type: merge
+    strategy: any
+    inputs: [release_payment, hold_payment]
+
+  # Phase: signoff
+  memo_header:
+    id: memo_header
+    type: tool_call
+    tool_name: replace
+    arguments_template: '{"text": "MEMO TOTAL: $1,240.00", "old": "$1,240.00", "new": "[REDACTED]"}'
+
+  finance_signoff:
+    id: finance_signoff
+    type: human_in_loop
+    prompt: "Payment decision drafted (redacted header ready). Finance sign-off? (type 'sign' or a note, then Enter)"
+    timeout_seconds: 600
+
+edges:
+  - from_id: invoice_parse
+    to_id: checks_fanout
+  - from_id: checks_fanout
+    to_id: policy_check
+  - from_id: checks_fanout
+    to_id: duplicate_check
+  - from_id: policy_check
+    to_id: checks_merge
+  - from_id: duplicate_check
+    to_id: checks_merge
+  - from_id: checks_merge
+    to_id: approval_gate
+  - from_id: approval_gate
+    to_id: release_payment
+    condition_label: "true"
+  - from_id: approval_gate
+    to_id: hold_payment
+    condition_label: "false"
+  - from_id: release_payment
+    to_id: payment_merge
+  - from_id: hold_payment
+    to_id: payment_merge
+  - from_id: payment_merge
+    to_id: memo_header
+  - from_id: memo_header
+    to_id: finance_signoff

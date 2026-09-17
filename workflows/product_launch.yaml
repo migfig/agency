@@ -1,0 +1,320 @@
+name: product-launch
+entry_point: launch_brief
+
+vram_limit: 16GB
+
+models:
+  writer:
+    endpoint: http://127.0.0.1:8100
+    path: Qwen3.5-4B-UD-Q6_K_XL.gguf
+    vram_size: 8GB
+  strategist:
+    endpoint: http://127.0.0.1:8101
+    path: Qwen3.5-0.8B-UD-Q8_K_XL.gguf
+    vram_size: 4GB
+
+phases:
+  - id: brief
+    name: Launch Brief
+    node_ids: [launch_brief]
+  - id: plan
+    name: Parallel Planning
+    node_ids: [plan_fanout, pricing_plan, messaging_plan, plan_merge]
+  - id: decide
+    name: Go/No-Go
+    node_ids: [readiness_gate, go_track, no_go_track, decision_merge]
+  - id: signoff
+    name: Executive Sign-off
+    node_ids: [exec_signoff]
+  - id: comms
+    name: Launch Communications
+    node_ids: [comms_fanout, press_release, changelog, comms_merge]
+  - id: ship
+    name: Ship
+    node_ids: [headline_case, launch_summary]
+
+nodes:
+  # Phase: brief
+  launch_brief:
+    id: launch_brief
+    type: agent
+    model: strategist
+    temperature: 0.3
+    system_prompt: You are the product strategist writing the launch brief.
+    prompt_template: |
+      Write the launch brief for this release: the problem, the release
+      in two sentences, the target segment, the launch date, and the one
+      metric that defines success. Under 100 words, plain text.
+
+      Release: Agency 0.5 "Reef" — the workflow engine gains replay-from-
+      checkpoint, a read-only event WebSocket, and a Flutter client.
+      Audience: self-hosting teams running local LLM agent workflows.
+      Launch date: 2026-09-18. Success metric: 40% of active runs using
+      at least one new feature within two weeks.
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: plan
+  plan_fanout:
+    id: plan_fanout
+    type: broadcast
+    targets: [pricing_plan, messaging_plan]
+
+  pricing_plan:
+    id: pricing_plan
+    type: agent
+    model: writer
+    temperature: 0.4
+    system_prompt: You are the pricing strategist for a self-hosted developer tool.
+    prompt_template: |
+      Draft the pricing treatment for this launch: what changes (or
+      explicitly does not change), the reasoning in two sentences, and the
+      objection you expect. End your reply with a final line:
+      "VERDICT: GO" or "VERDICT: NO-GO".
+
+      Launch brief:
+      {{ nodes.launch_brief.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  messaging_plan:
+    id: messaging_plan
+    type: agent
+    model: writer
+    temperature: 0.5
+    system_prompt: You are the product marketing lead planning launch messaging.
+    prompt_template: |
+      Draft the messaging plan for this launch: the one-line promise, the
+      two supporting proof points, and the channel order (changelog,
+      docs, social). End your reply with a final line: "VERDICT: GO" or
+      "VERDICT: NO-GO".
+
+      Launch brief:
+      {{ nodes.launch_brief.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  plan_merge:
+    id: plan_merge
+    type: merge
+    strategy: all
+    inputs: [pricing_plan, messaging_plan]
+
+  # Phase: decide
+  readiness_gate:
+    id: readiness_gate
+    type: conditional
+    condition: "{{ nodes.plan_merge.output }} contains VERDICT: GO"
+    branches:
+      "true": go_track
+      "false": no_go_track
+
+  go_track:
+    id: go_track
+    type: agent
+    model: strategist
+    temperature: 0.3
+    system_prompt: You are the launch lead preparing the go-track plan.
+    prompt_template: |
+      Both plans are in. Write the go-track: the launch-day sequence in
+      three steps, the rollback trigger, and the post-launch check at
+      24h. Under 90 words, plain text.
+
+      Launch brief:
+      {{ nodes.launch_brief.output }}
+
+      Plans:
+      {{ nodes.plan_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  no_go_track:
+    id: no_go_track
+    type: agent
+    model: strategist
+    temperature: 0.3
+    system_prompt: You are the launch lead preparing the no-go plan.
+    prompt_template: |
+      A plan did not pass. Write the no-go track: what is blocked, the
+      single decision needed to unblock it, and the fallback launch scope.
+      Under 90 words, plain text.
+
+      Launch brief:
+      {{ nodes.launch_brief.output }}
+
+      Plans:
+      {{ nodes.plan_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  decision_merge:
+    id: decision_merge
+    type: merge
+    strategy: any
+    inputs: [go_track, no_go_track]
+
+  # Phase: signoff
+  exec_signoff:
+    id: exec_signoff
+    type: human_in_loop
+    prompt: "Go/no-go prepared. Executive decision? (type 'go', 'no-go', or a note, then Enter)"
+    timeout_seconds: 300
+
+  # Phase: comms
+  comms_fanout:
+    id: comms_fanout
+    type: broadcast
+    targets: [press_release, changelog]
+
+  press_release:
+    id: press_release
+    type: agent
+    model: writer
+    temperature: 0.5
+    system_prompt: You write crisp, jargon-light press releases.
+    prompt_template: |
+      Write the launch announcement (under 120 words): headline-ready
+      first sentence, the what/who/why, and the one metric the team is
+      targeting. Plain text.
+
+      Decision:
+      {{ nodes.decision_merge.output }}
+
+      Executive decision:
+      {{ nodes.exec_signoff.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+    fallback: comms_fallback
+
+  changelog:
+    id: changelog
+    type: agent
+    model: writer
+    temperature: 0.4
+    system_prompt: You write developer changelogs people actually read.
+    prompt_template: |
+      Write the v0.5 "Reef" changelog (under 100 words): three feature
+      entries (replay-from-checkpoint, event WebSocket, Flutter client),
+      each with a one-line "why it matters". Plain text.
+
+      Decision:
+      {{ nodes.decision_merge.output }}
+
+      Executive decision:
+      {{ nodes.exec_signoff.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+    fallback: comms_fallback
+
+  comms_merge:
+    id: comms_merge
+    type: merge
+    strategy: all
+    inputs: [press_release, changelog]
+
+  # Phase: ship
+  headline_case:
+    id: headline_case
+    type: tool_call
+    tool_name: upper
+    arguments_template: '{"text": "Agency 0.5 Reef: replay, stream, and ship your agent workflows"}'
+
+  launch_summary:
+    id: launch_summary
+    type: agent
+    model: strategist
+    temperature: 0.3
+    system_prompt: You write the post-launch summary for the all-hands.
+    prompt_template: |
+      Write the launch summary (under 120 words, plain text): the
+      outcome, the headline, the two communications produced, and the
+      24h check plan. End with a line starting with "launch:".
+
+      Launch brief:
+      {{ nodes.launch_brief.output }}
+
+      Decision:
+      {{ nodes.decision_merge.output }}
+
+      Executive decision:
+      {{ nodes.exec_signoff.output }}
+
+      Communications:
+      {{ nodes.comms_merge.output }}
+
+      Headline:
+      {{ nodes.headline_case.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Standby: fallback agent for both comms agents.
+  # No in/out edges, not the entry point -> never launched by the DAG.
+  comms_fallback:
+    id: comms_fallback
+    type: agent
+    model: writer
+    temperature: 0.2
+    system_prompt: You are the communications writer of last resort.
+    prompt_template: |
+      A primary communications agent failed. Write a minimal safe launch
+      note: what shipped, that details follow, and where to read them.
+      Do not invent dates or metrics.
+
+      Decision:
+      {{ nodes.decision_merge.output }}
+
+edges:
+  - from_id: launch_brief
+    to_id: plan_fanout
+  - from_id: plan_fanout
+    to_id: pricing_plan
+  - from_id: plan_fanout
+    to_id: messaging_plan
+  - from_id: pricing_plan
+    to_id: plan_merge
+  - from_id: messaging_plan
+    to_id: plan_merge
+  - from_id: plan_merge
+    to_id: readiness_gate
+  - from_id: readiness_gate
+    to_id: go_track
+    condition_label: "true"
+  - from_id: readiness_gate
+    to_id: no_go_track
+    condition_label: "false"
+  - from_id: go_track
+    to_id: decision_merge
+  - from_id: no_go_track
+    to_id: decision_merge
+  - from_id: decision_merge
+    to_id: exec_signoff
+  - from_id: exec_signoff
+    to_id: comms_fanout
+  - from_id: comms_fanout
+    to_id: press_release
+  - from_id: comms_fanout
+    to_id: changelog
+  - from_id: press_release
+    to_id: comms_merge
+  - from_id: changelog
+    to_id: comms_merge
+  - from_id: comms_merge
+    to_id: headline_case
+  - from_id: headline_case
+    to_id: launch_summary

@@ -1,0 +1,167 @@
+name: order-fulfillment
+entry_point: order_classify
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: classify
+    name: Classification
+    node_ids: [order_classify, band_norm, band_gate]
+  - id: handle
+    name: Fulfillment Handling
+    node_ids: [premium_handling, standard_handling, fulfillment_merge]
+  - id: release
+    name: Risk Release
+    node_ids: [risk_gate, ship_confirm, hold_review]
+
+nodes:
+  # Phase: classify
+  order_classify:
+    id: order_classify
+    type: agent
+    model: draft
+    temperature: 0.1
+    system_prompt: >
+      You are the fulfillment classifier. You reply with exactly one word
+      and nothing else.
+    prompt_template: |
+      Read the order below. Reply with exactly one word: "high" if the
+      order total is above 500 USD or the customer has prior VIP history,
+      otherwise "low". No punctuation, no explanation.
+
+      Order ORD-77140 (customer: Meridian Labs, VIP since 2024)
+      Items: 2x GPU node license (annual)
+      Total: $1,240.00
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 60
+
+  band_norm:
+    id: band_norm
+    type: tool_call
+    tool_name: upper
+    arguments_template: '{"text": "{{ nodes.order_classify.output }}"}'
+
+  band_gate:
+    id: band_gate
+    type: conditional
+    condition: "{{ nodes.band_norm.output }} == HIGH"
+    branches:
+      "true": premium_handling
+      "false": standard_handling
+
+  # Phase: handle
+  premium_handling:
+    id: premium_handling
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the premium fulfillment specialist.
+    prompt_template: |
+      Draft the premium handling plan for this order: dedicated carrier,
+      expedited window, named account manager, and the status cadence the
+      customer will hear. Under 80 words, plain text. End your reply with
+      a final line: "RISK: none" or "RISK: yes" (yes only for a concrete,
+      named risk).
+
+      Band:
+      {{ nodes.band_norm.output }}
+
+      Order: ORD-77140, customer Meridian Labs (VIP since 2024),
+      2x GPU node license annual, total $1,240.00, ships to a data
+      center in Frankfurt.
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  standard_handling:
+    id: standard_handling
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the standard fulfillment coordinator.
+    prompt_template: |
+      Draft the standard handling plan for this order: default carrier,
+      standard window, automated notifications, and the escalation path if
+      the window slips. Under 80 words, plain text. End your reply with a
+      final line: "RISK: none" or "RISK: yes" (yes only for a concrete,
+      named risk).
+
+      Band:
+      {{ nodes.band_norm.output }}
+
+      Order: ORD-77140, customer Meridian Labs, 2x GPU node license
+      annual, total $1,240.00, ships to a data center in Frankfurt.
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  fulfillment_merge:
+    id: fulfillment_merge
+    type: merge
+    strategy: any
+    inputs: [premium_handling, standard_handling]
+
+  # Phase: release
+  risk_gate:
+    id: risk_gate
+    type: conditional
+    condition: "{{ nodes.fulfillment_merge.output }} not contains RISK: yes"
+    branches:
+      "true": ship_confirm
+      "false": hold_review
+
+  ship_confirm:
+    id: ship_confirm
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You write the outbound ship confirmation for fulfillment.
+    prompt_template: |
+      Write the ship confirmation to the customer from this handling plan:
+      what is happening, when, and who to contact. Under 60 words, plain
+      text.
+
+      Handling plan:
+      {{ nodes.fulfillment_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  hold_review:
+    id: hold_review
+    type: human_in_loop
+    prompt: "Order flagged with a risk. Review the plan and type the hold decision (Enter to submit)."
+    timeout_seconds: 300
+
+edges:
+  - from_id: order_classify
+    to_id: band_norm
+  - from_id: band_norm
+    to_id: band_gate
+  - from_id: band_gate
+    to_id: premium_handling
+    condition_label: "true"
+  - from_id: band_gate
+    to_id: standard_handling
+    condition_label: "false"
+  - from_id: premium_handling
+    to_id: fulfillment_merge
+  - from_id: standard_handling
+    to_id: fulfillment_merge
+  - from_id: fulfillment_merge
+    to_id: risk_gate
+  - from_id: risk_gate
+    to_id: ship_confirm
+    condition_label: "true"
+  - from_id: risk_gate
+    to_id: hold_review
+    condition_label: "false"

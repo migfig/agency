@@ -1,0 +1,284 @@
+name: dspy_generate_lint_run
+entry_point: generate
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-12b-it-UD-Q4_K_XL.gguf
+    vram_size: 12GB
+    startup_timeout: 300.0
+    timeout_seconds: 600.0
+
+tools:
+  save_program:
+    kind: file_write
+    path: "programs/{name}.py"
+    description: "Save generated code to programs/<name>.py"
+  lint_python:
+    kind: shell
+    command: "ruff check {file}"
+    description: "Lint a Python file with ruff"
+  run_python:
+    kind: program
+    program: "{file}"
+    description: "Run a Python script file"
+
+nodes:
+  generate:
+    id: generate
+    type: agent
+    model: draft
+    prompt_template: >
+      # DSPy Blog Post Generator — Code Generation Context
+
+      ## Task
+
+      Generate a single-file Python program: a 3-stage DSPy pipeline (Writer → Reviewer → Editor) that produces markdown blog posts via a local llama.cpp server, with streaming Rich UI feedback and CLI arguments.
+
+      ## Architecture
+
+      ```
+      [CLI] → [Server Manager] → [BlogPostPipeline]
+                                          │
+                                          ├─ WriterSig   (topic, audience, tone, length → draft)
+                                          ├─ ReviewerSig (draft, audience, tone → feedback)
+                                          └─ EditorSig   (draft, feedback → final_post)
+                                          │
+                                          → [Rich Live Display] → [save_post] → blogs/*.md
+      ```
+
+      ## File Structure
+
+      ```
+      1. Imports (stdlib → third-party → local; blank line between groups)
+      2. load_dotenv() at module level (try/except pass)
+      3. console = Console() at module level
+      4. Utility functions: wait_for_server, start_server, stop_server, save_post
+      5. RichStatusMessageProvider class
+      6. dspy.Signature classes: WriterSig, ReviewerSig, EditorSig
+      7. BlogPostPipeline(dspy.Module) with __init__, _setup_streaming, _run_streaming_stage, generate_post
+      8. parse_args() with argparse
+      9. main() with try/except/finally
+      10. if __name__ == "__main__": main()
+      ```
+
+      ## Code Style
+
+      - `snake_case` functions/vars, `PascalCase` classes, `SCREAMING_SNAKE_CASE` constants
+      - Annotate all parameters and return values using `list[str]`, `dict[str, str]` (not `List`/`Dict`)
+      - f-strings for interpolation
+      - No docstrings, no inline comments
+      - `try/except` with specific types; `KeyboardInterrupt` handled separately; `finally` for cleanup
+
+      ## Signatures
+
+      ```python
+      class WriterSig(dspy.Signature):
+          """Generate a structured blog post draft matching the given topic, audience, tone, and length constraints."""
+          topic: str = dspy.InputField()
+          audience: str = dspy.InputField()
+          tone: str = dspy.InputField()
+          length: str = dspy.InputField()
+          draft: str = dspy.OutputField(desc="A well-structured blog post draft in markdown")
+
+      class ReviewerSig(dspy.Signature):
+          """Review the draft for tone alignment, audience relevance, and structural quality."""
+          draft: str = dspy.InputField()
+          audience: str = dspy.InputField()
+          tone: str = dspy.InputField()
+          feedback: str = dspy.OutputField(desc="Constructive feedback on tone mismatches, audience drift, and structural improvements")
+
+      class EditorSig(dspy.Signature):
+          """Incorporate reviewer feedback into the draft to produce a polished final post."""
+          draft: str = dspy.InputField()
+          feedback: str = dspy.InputField()
+          final_post: str = dspy.OutputField(desc="The final polished blog post in markdown format")
+      ```
+
+      ## Pipeline Module
+
+      ```python
+      class BlogPostPipeline(dspy.Module):
+          def __init__(self):
+              super().__init__()
+              self.writer = dspy.Predict(WriterSig)
+              self.reviewer = dspy.Predict(ReviewerSig)
+              self.editor = dspy.Predict(EditorSig)
+              self._setup_streaming()
+
+          def _setup_streaming(self):
+              self.stream_writer = dspy.streamify(
+                  self.writer,
+                  stream_listeners=[dspy.streaming.StreamListener(signature_field_name="draft")],
+                  status_message_provider=RichStatusMessageProvider(),
+                  async_streaming=False,
+              )
+              self.stream_reviewer = dspy.streamify(
+                  self.reviewer,
+                  stream_listeners=[dspy.streaming.StreamListener(signature_field_name="feedback")],
+                  status_message_provider=RichStatusMessageProvider(),
+                  async_streaming=False,
+              )
+              self.stream_editor = dspy.streamify(
+                  self.editor,
+                  stream_listeners=[dspy.streaming.StreamListener(signature_field_name="final_post")],
+                  status_message_provider=RichStatusMessageProvider(),
+                  async_streaming=False,
+              )
+
+          def _run_streaming_stage(self, stream_generator, progress, task_id, live):
+              buffers = {}
+              for chunk in stream_generator:
+                  if isinstance(chunk, dspy.streaming.StreamResponse):
+                      field = chunk.signature_field_name
+                      buffers.setdefault(field, "")
+                      buffers[field] += chunk.chunk
+                      live.update(Text(buffers[field][-800:], style="cyan"), refresh=True)
+                  elif isinstance(chunk, dspy.Prediction):
+                      progress.update(task_id, completed=100)
+                      return chunk
+              return None
+
+          def generate_post(self, topic: str, audience: str, tone: str, length: str) -> str:
+              # Run all 3 stages sequentially with streaming + Rich Progress/Live display
+              # Pass output from one stage to the next
+              # Return final_post or empty string on failure
+      ```
+
+      ## Status Provider
+
+      ```python
+      class RichStatusMessageProvider(dspy.streaming.StatusMessageProvider):
+          def lm_start_status_message(self, instance, inputs): return "Calling AI..."
+          def lm_end_status_message(self, outputs): return "Response received"
+          def module_start_status_message(self, instance, inputs):
+              return f"{type(instance).__name__}..."
+          def module_end_status_message(self, outputs): return "Complete"
+          def tool_start_status_message(self, instance, inputs): return "Tool..."
+          def tool_end_status_message(self, outputs): return "Done"
+      ```
+
+      ## Utility Functions
+
+      ### Server Management
+
+      ```python
+      def wait_for_server(base_url: str, timeout_s: float) -> bool:
+          deadline = time.time() + timeout_s
+          while time.time() < deadline:
+              try:
+                  if requests.get(f"{base_url}/health", timeout=3).status_code == 200:
+                      return True
+              except requests.exceptions.RequestException:
+                  pass
+              time.sleep(1)
+          return False
+
+      def start_server(bash_script: str, model_name: str, host: str, port: int, extra_args: list[str]) -> subprocess.Popen:
+          # Expand ~/ paths, extract model name from openai/model format
+          # Build cmd: [bash_script, "-m", model_name, "--host", host, "--port", str(port)] + extra_args
+          # spawn subprocess with preexec_fn=os.setsid
+          # Return proc
+
+      def stop_server(proc: Any) -> None:
+          # SIGTERM → wait 20s → SIGKILL fallback
+      ```
+
+      ### File Save
+
+      ```python
+      def save_post(final_post: str, topic: str) -> str:
+          # Create blogs/ dir, timestamp filename, sanitize topic slug
+          # Write "# {topic}\n\n{final_post}\n\n---\nGenerated: {iso_timestamp}"
+          # Return filepath
+      ```
+
+      ## CLI Arguments
+
+      | Argument | Type | Default |
+      |---|---|---|
+      | `--topic` | str | `"AI Ethics"` |
+      | `--audience` | str | `"Developers"` |
+      | `--tone` | str | `"Analytical"` |
+      | `--length` | str | `"1000"` |
+      | `--model` | str | `"openai/gemma-4-2b"` |
+      | `--api-key` | str | `"sk-test"` |
+      | `--base-url` | str | `"http://localhost:11435/v1"` |
+      | `--cache` | str | `"false"` |
+      | `--server-binary` | str | `"llama-cpp-server.sh"` |
+      | `--server-extra-args` | str (nargs="+") | `["-r", "true", "-c", "8192"]` |
+
+      ## Environment Defaults
+
+      ```python
+      os.environ.get("LITELLM_API_KEY", "sk-test")
+      os.environ.get("LITELLM_BASE_TEST_URL", "http://localhost:11435/v1")
+      os.environ.get("LITELLM_HOST_TEST", "localhost")
+      os.environ.get("LITELLM_PORT_TEST", "11435")
+      os.environ.get("LITELLM_CACHE", "false")
+      ```
+
+      ## dspy.LM Setup
+
+      ```python
+      lm = dspy.LM(model, api_key=api_key, base_url=base_url, cache=cache_bool)
+      adapter = dspy.ChatAdapter()
+      dspy.configure(lm=lm, adapter=adapter)
+      ```
+
+      ## main() Flow
+
+      ```python
+      def main():
+          args = parse_args()
+          proc = None
+          try:
+              # 1. Start server via start_server() with args
+              # 2. Wait via wait_for_server(args.base_url, 60.0) — exit if timeout
+              # 3. Configure dspy.LM + ChatAdapter
+              # 4. Instantiate BlogPostPipeline
+              # 5. Call pipeline.generate_post(topic, audience, tone, length)
+              # 6. If result: save_post(), print filepath + content
+              # 7. If empty: print failure message
+          except KeyboardInterrupt:
+              console.print("[bold red]Interrupted[/]")
+              sys.exit(1)
+          except Exception as e:
+              console.print(f"[bold red]Error: {e}[/]")
+              sys.exit(1)
+          finally:
+              if proc:
+                  stop_server(proc)
+      ```
+
+      ## Expected Run
+
+      ```bash
+      python program.py --topic "AI Ethics" --audience Developers --tone Analytical --length 1000
+      ```
+
+      Output: `blogs/20260717_164628_ai_ethics.md` containing a polished markdown blog post.
+
+      Rules: output ONLY the raw Python code - no markdown, no code
+      fences, no explanation. Use single-quoted strings only; do not use
+      double quotes or backslashes anywhere. The program must be lint-clean
+      under ruff's default rules (no unused imports, no unused variables).
+  save_program:
+    id: save_program
+    type: tool_call
+    tool_name: save_program
+    arguments_template: '{"name": "program", "content": "{{ nodes.generate.output }}"}'
+  lint_python:
+    id: lint_python
+    type: tool_call
+    tool_name: lint_python
+    arguments_template: '{"file": "{{ nodes.save_program.output }}"}'
+  run_python:
+    id: run_python
+    type: tool_call
+    tool_name: run_python
+    arguments_template: '{"file": "{{ nodes.save_program.output }}"}'
+edges:
+  - {from_id: generate, to_id: save_program}
+  - {from_id: save_program, to_id: lint_python}
+  - {from_id: lint_python, to_id: run_python}

@@ -1,0 +1,54 @@
+name: generate_lint_run
+entry_point: generate
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: MiniCPM5-2B-Q8_0.gguf
+    vram_size: 4GB
+
+tools:
+  save_program:
+    kind: file_write
+    path: "programs/{name}.py"
+    description: "Save generated code to programs/<name>.py"
+  lint_python:
+    kind: shell
+    command: "ruff check {file}"
+    description: "Lint a Python file with ruff"
+  run_python:
+    kind: program
+    program: "{file}"
+    description: "Run a Python script file"
+
+nodes:
+  generate:
+    id: generate
+    type: agent
+    model: draft
+    prompt_template: >
+      Write one small, complete Python program. It must print exactly two
+      lines: first the text hello from the generated program, then the value
+      of 6 * 7. Rules: output ONLY the raw Python code - no markdown, no code
+      fences, no explanation. Use single-quoted strings only; do not use
+      double quotes or backslashes anywhere. The program must be lint-clean
+      under ruff's default rules (no unused imports, no unused variables).
+  save_program:
+    id: save_program
+    type: tool_call
+    tool_name: save_program
+    arguments_template: '{"name": "generated", "content": "{{ nodes.generate.output }}"}'
+  lint_python:
+    id: lint_python
+    type: tool_call
+    tool_name: lint_python
+    arguments_template: '{"file": "{{ nodes.save_program.output }}"}'
+  run_python:
+    id: run_python
+    type: tool_call
+    tool_name: run_python
+    arguments_template: '{"file": "{{ nodes.save_program.output }}"}'
+edges:
+  - {from_id: generate, to_id: save_program}
+  - {from_id: save_program, to_id: lint_python}
+  - {from_id: lint_python, to_id: run_python}

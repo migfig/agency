@@ -1,0 +1,243 @@
+name: code-review-panel
+entry_point: change_summary
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: intake
+    name: Change Intake
+    node_ids: [change_summary]
+  - id: review
+    name: Parallel Review
+    node_ids: [review_fanout, security_review, style_review, correctness_review, panel_merge]
+  - id: verdict
+    name: Verdict
+    node_ids: [verdict_gate, request_changes, approve_draft, decision_merge]
+  - id: release
+    name: Release Gate
+    node_ids: [release_gate, release_note]
+
+nodes:
+  # Phase: intake
+  change_summary:
+    id: change_summary
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: You are the release engineer summarizing a pull request for a review panel.
+    prompt_template: |
+      Summarize this change in under 60 words: what it does, what it
+      touches, and the risk surface (network, filesystem, concurrency).
+
+      PR #482 "Add fsync'd WAL to run state store"
+      diff:
+        + class RunStateStore:
+        +     def append(self, record):
+        +         with self._wal.open("a") as f:
+        +             f.write(json.dumps(record) + "\n")
+        +             f.flush()
+        +             os.fsync(f.fileno())
+        -     def append(self, record):
+        -         self._mem.append(record)
+        -         self._flush_later()
+      Notes: replaces the buffered in-memory flush with per-record fsync.
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: review
+  review_fanout:
+    id: review_fanout
+    type: broadcast
+    targets: [security_review, style_review, correctness_review]
+
+  security_review:
+    id: security_review
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are a security reviewer. Be specific about the exploit surface.
+    prompt_template: |
+      Review this change for security issues only (secrets, injection,
+      trust boundaries, durability guarantees). Two to four sentences.
+      End your reply with a final line: "VERDICT: APPROVE" or
+      "VERDICT: BLOCK".
+
+      Change summary:
+      {{ nodes.change_summary.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  style_review:
+    id: style_review
+    type: agent
+    model: draft
+    temperature: 0.4
+    system_prompt: You are a pragmatic code style reviewer.
+    prompt_template: |
+      Review this change for style and maintainability only (naming,
+      structure, obvious simplifications). Two to four sentences.
+      End your reply with a final line: "VERDICT: APPROVE" or
+      "VERDICT: BLOCK".
+
+      Change summary:
+      {{ nodes.change_summary.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  correctness_review:
+    id: correctness_review
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are a correctness reviewer focused on failure modes.
+    prompt_template: |
+      Review this change for correctness only (crash consistency, error
+      handling, edge cases, performance regressions). Two to four
+      sentences. End your reply with a final line: "VERDICT: APPROVE"
+      or "VERDICT: BLOCK".
+
+      Change summary:
+      {{ nodes.change_summary.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  panel_merge:
+    id: panel_merge
+    type: merge
+    strategy: all
+    inputs: [security_review, style_review, correctness_review]
+
+  # Phase: verdict
+  verdict_gate:
+    id: verdict_gate
+    type: conditional
+    condition: "{{ nodes.panel_merge.output }} contains BLOCK"
+    branches:
+      "true": request_changes
+      "false": approve_draft
+
+  request_changes:
+    id: request_changes
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the release engineer drafting a request for changes.
+    prompt_template: |
+      The review panel blocked this change. Draft a concise request for
+      changes: list the blocking concerns from the panel, in priority
+      order, under 80 words, plain text.
+
+      Change summary:
+      {{ nodes.change_summary.output }}
+
+      Panel verdicts:
+      {{ nodes.panel_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  approve_draft:
+    id: approve_draft
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the release engineer drafting an approval note.
+    prompt_template: |
+      The review panel approved this change. Draft a one-paragraph
+      approval note capturing what was checked and any non-blocking
+      nits, under 80 words, plain text.
+
+      Change summary:
+      {{ nodes.change_summary.output }}
+
+      Panel verdicts:
+      {{ nodes.panel_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  decision_merge:
+    id: decision_merge
+    type: merge
+    strategy: any
+    inputs: [request_changes, approve_draft]
+
+  # Phase: release
+  release_gate:
+    id: release_gate
+    type: human_in_loop
+    prompt: "Panel decision drafted. Approve the release decision? (type 'approve' or a note, then Enter)"
+    timeout_seconds: 300
+
+  release_note:
+    id: release_note
+    type: agent
+    model: draft
+    temperature: 0.4
+    system_prompt: You write the final release note for the team channel.
+    prompt_template: |
+      Write the final release note (under 100 words, plain text). State
+      the change, the panel outcome, the human decision, and the next
+      step. End with a line starting with "status:".
+
+      Change summary:
+      {{ nodes.change_summary.output }}
+
+      Panel verdicts:
+      {{ nodes.panel_merge.output }}
+
+      Decision draft:
+      {{ nodes.decision_merge.output }}
+
+      Human decision:
+      {{ nodes.release_gate.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+edges:
+  - from_id: change_summary
+    to_id: review_fanout
+  - from_id: review_fanout
+    to_id: security_review
+  - from_id: review_fanout
+    to_id: style_review
+  - from_id: review_fanout
+    to_id: correctness_review
+  - from_id: security_review
+    to_id: panel_merge
+  - from_id: style_review
+    to_id: panel_merge
+  - from_id: correctness_review
+    to_id: panel_merge
+  - from_id: panel_merge
+    to_id: verdict_gate
+  - from_id: verdict_gate
+    to_id: request_changes
+    condition_label: "true"
+  - from_id: verdict_gate
+    to_id: approve_draft
+    condition_label: "false"
+  - from_id: request_changes
+    to_id: decision_merge
+  - from_id: approve_draft
+    to_id: decision_merge
+  - from_id: decision_merge
+    to_id: release_gate
+  - from_id: release_gate
+    to_id: release_note

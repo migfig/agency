@@ -1,0 +1,40 @@
+name: log-scrubber
+entry_point: normalize_case
+
+phases:
+  - id: scrub
+    name: Scrub
+    node_ids: [normalize_case, mask_secret, strip_padding, clean_line]
+
+nodes:
+  normalize_case:
+    id: normalize_case
+    type: tool_call
+    tool_name: lower
+    arguments_template: '{"text": " 2026-09-06T02:14:09Z INFO auth.service user=meridian-42 token=Bearer sk-live-8f3a91c2 request completed in 42ms "}'
+
+  mask_secret:
+    id: mask_secret
+    type: tool_call
+    tool_name: replace
+    arguments_template: '{"text": "{{ nodes.normalize_case.output }}", "old": "bearer sk-live-8f3a91c2", "new": "redacted"}'
+
+  strip_padding:
+    id: strip_padding
+    type: tool_call
+    tool_name: trim
+    arguments_template: '{"text": "{{ nodes.mask_secret.output }}"}'
+
+  clean_line:
+    id: clean_line
+    type: tool_call
+    tool_name: echo
+    arguments_template: '{"text": "scrubbed: {{ nodes.strip_padding.output }}"}'
+
+edges:
+  - from_id: normalize_case
+    to_id: mask_secret
+  - from_id: mask_secret
+    to_id: strip_padding
+  - from_id: strip_padding
+    to_id: clean_line

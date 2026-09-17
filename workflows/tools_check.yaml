@@ -1,0 +1,32 @@
+name: tools_check
+entry_point: say
+nodes:
+  say:
+    id: say
+    type: tool_call
+    tool_name: shell
+    arguments_template: '{"command": "echo hello-from-shell"}'
+  save:
+    id: save
+    type: tool_call
+    tool_name: write_file
+    arguments_template: '{"path": "programs/check.py", "content": "print(6 * 7)"}'
+  lint:
+    id: lint
+    type: tool_call
+    tool_name: shell
+    arguments_template: '{"command": "ruff check {{ nodes.save.output }}"}'
+  run:
+    id: run
+    type: tool_call
+    tool_name: program
+    arguments_template: '{"program": "{{ nodes.save.output }}"}'
+  boom:
+    id: boom
+    type: tool_call
+    tool_name: shell
+    arguments_template: '{"command": "false", "timeout_seconds": 10}'
+edges:
+  - {from_id: say, to_id: save}
+  - {from_id: save, to_id: lint}
+  - {from_id: lint, to_id: run}

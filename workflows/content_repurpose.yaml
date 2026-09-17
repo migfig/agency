@@ -1,0 +1,160 @@
+name: content-repurposing
+entry_point: article_digest
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: digest
+    name: Digest
+    node_ids: [article_digest]
+  - id: route
+    name: Tone Routing
+    node_ids: [tone_gate]
+  - id: channel
+    name: Channel Drafts
+    node_ids: [tech_thread, press_blurb, channel_merge]
+  - id: package
+    name: Package
+    node_ids: [headline, length_check, content_pack]
+
+nodes:
+  # Phase: digest
+  article_digest:
+    id: article_digest
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are a staff editor for a developer-focused blog.
+    prompt_template: |
+      Digest the article below. Reply in two parts:
+      1. A three-sentence digest of the key argument.
+      2. A final line starting with "tone:" followed by either
+         "technical" or "general".
+
+      Title: "The Model Registry Is Your Pipeline's Immune System"
+      Excerpt: "Running a batch of LLM jobs against a shared GPU box means
+      something has to decide which model lives in VRAM, when, and for how
+      long. We built a pre-execution validation pass that resolves every
+      referenced model to a live endpoint before a single node runs, and
+      auto-starts local servers when the declared endpoint is dead. Here is
+      what broke, what the registry caught, and the failure modes we still
+      see in production."
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: route
+  tone_gate:
+    id: tone_gate
+    type: conditional
+    condition: "{{ nodes.article_digest.output }} contains technical"
+    branches:
+      "true": tech_thread
+      "false": press_blurb
+
+  # Phase: channel
+  tech_thread:
+    id: tech_thread
+    type: agent
+    model: draft
+    temperature: 0.6
+    system_prompt: You write punchy developer-facing social posts.
+    prompt_template: |
+      Turn the digest into a 4-tweet technical thread, one tweet per line,
+      no numbering. Lead with the failure mode, end with the lesson.
+
+      Digest:
+      {{ nodes.article_digest.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  press_blurb:
+    id: press_blurb
+    type: agent
+    model: draft
+    temperature: 0.5
+    system_prompt: You write short press blurbs for a developer tooling company.
+    prompt_template: |
+      Turn the digest into a 40-word press blurb a general audience can
+      understand without knowing the jargon.
+
+      Digest:
+      {{ nodes.article_digest.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  channel_merge:
+    id: channel_merge
+    type: merge
+    strategy: any
+    inputs: [tech_thread, press_blurb]
+
+  # Phase: package
+  headline:
+    id: headline
+    type: tool_call
+    tool_name: upper
+    arguments_template: '{"text": "Why Every LLM Pipeline Needs A Model Registry"}'
+
+  length_check:
+    id: length_check
+    type: tool_call
+    tool_name: length
+    arguments_template: '{"text": "{{ nodes.headline.output }}"}'
+
+  content_pack:
+    id: content_pack
+    type: agent
+    model: draft
+    temperature: 0.4
+    system_prompt: You are the content ops lead assembling a launch pack.
+    prompt_template: |
+      Assemble the final content pack. Output in order, plain text, no
+      markdown:
+      DIGEST, then HEADLINE, then CHANNEL COPY, then CHAR COUNT (use the
+      provided count), then one line on the best posting window.
+
+      Digest:
+      {{ nodes.article_digest.output }}
+
+      Headline:
+      {{ nodes.headline.output }}
+
+      Channel copy:
+      {{ nodes.channel_merge.output }}
+
+      Headline char count:
+      {{ nodes.length_check.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+edges:
+  - from_id: article_digest
+    to_id: tone_gate
+  - from_id: tone_gate
+    to_id: tech_thread
+    condition_label: "true"
+  - from_id: tone_gate
+    to_id: press_blurb
+    condition_label: "false"
+  - from_id: tech_thread
+    to_id: channel_merge
+  - from_id: press_blurb
+    to_id: channel_merge
+  - from_id: channel_merge
+    to_id: headline
+  - from_id: headline
+    to_id: length_check
+  - from_id: length_check
+    to_id: content_pack
