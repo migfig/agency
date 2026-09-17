@@ -1,0 +1,273 @@
+name: market-research-brief
+entry_point: scope
+
+vram_limit: 16GB
+context_window: 4096
+summarize_threshold: 50
+summarizer_model: researcher
+
+models:
+  researcher:
+    endpoint: http://127.0.0.1:8101
+    path: Qwen3.5-0.8B-UD-Q8_K_XL.gguf
+    vram_size: 4GB
+  writer:
+    endpoint: http://127.0.0.1:8100
+    path: Qwen3.5-4B-UD-Q6_K_XL.gguf
+    vram_size: 8GB
+
+phases:
+  - id: scope
+    name: Scoping
+    node_ids: [scope]
+  - id: research
+    name: Parallel Research
+    node_ids: [research_fanout, market_scan, competitor_scan, customer_voice, evidence_merge]
+  - id: analysis
+    name: Gap Analysis and Synthesis
+    node_ids: [coverage_gate, deep_dive, synthesis]
+  - id: review
+    name: Executive Review
+    node_ids: [exec_review]
+  - id: delivery
+    name: Delivery
+    node_ids: [final_brief, brief_header, delivery_pack]
+
+nodes:
+  # Phase: scope
+  scope:
+    id: scope
+    type: agent
+    model: researcher
+    temperature: 0.2
+    system_prompt: You are a research lead scoping a market study.
+    prompt_template: |
+      Turn the request below into a crisp research brief: the decision it
+      informs, three research questions, and the definition of "enough
+      evidence" for each. Under 120 words, plain text.
+
+      Request: "Should we position our local-LLM workflow orchestrator
+      for SMB DevOps teams, or for platform engineering groups at mid-size
+      companies? We need a one-page brief before the Q4 planning review."
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: research
+  research_fanout:
+    id: research_fanout
+    type: broadcast
+    targets: [market_scan, competitor_scan, customer_voice]
+
+  market_scan:
+    id: market_scan
+    type: agent
+    model: researcher
+    temperature: 0.3
+    system_prompt: You are a market analyst. Cite concrete, checkable signals.
+    prompt_template: |
+      Scan the market landscape for the scope below. Cover: market size
+      signals, growth direction, and the two biggest structural shifts in
+      the last 18 months. Under 100 words. If a sub-question cannot be
+      answered from available evidence, add a line starting with "GAP:"
+      naming it.
+
+      Scope:
+      {{ nodes.scope.output }}
+    retry:
+      max_attempts: 3
+      base_delay_seconds: 0.5
+      max_delay_seconds: 5
+      timeout_seconds: 120
+
+  competitor_scan:
+    id: competitor_scan
+    type: agent
+    model: researcher
+    temperature: 0.3
+    system_prompt: You are a competitive intelligence analyst.
+    prompt_template: |
+      Profile the competitive set for the scope below: the closest
+      competitors, their positioning, and the gap none of them fill.
+      Under 100 words. If a sub-question cannot be answered from available
+      evidence, add a line starting with "GAP:" naming it.
+
+      Scope:
+      {{ nodes.scope.output }}
+    retry:
+      max_attempts: 3
+      base_delay_seconds: 0.5
+      max_delay_seconds: 5
+      timeout_seconds: 120
+
+  customer_voice:
+    id: customer_voice
+    type: agent
+    model: researcher
+    temperature: 0.3
+    system_prompt: You are a customer research analyst working from public signals.
+    prompt_template: |
+      Summarize customer voice for the scope below: the recurring jobs-to-be-
+      done in public forums and review sites, the top two complaints about
+      incumbents, and who is vocal vs who is silent. Under 100 words. If a
+      sub-question cannot be answered from available evidence, add a line
+      starting with "GAP:" naming it.
+
+      Scope:
+      {{ nodes.scope.output }}
+    retry:
+      max_attempts: 3
+      base_delay_seconds: 0.5
+      max_delay_seconds: 5
+      timeout_seconds: 120
+
+  evidence_merge:
+    id: evidence_merge
+    type: merge
+    strategy: all
+    inputs: [market_scan, competitor_scan, customer_voice]
+
+  # Phase: analysis
+  coverage_gate:
+    id: coverage_gate
+    type: conditional
+    condition: "{{ nodes.evidence_merge.output }} contains GAP"
+    branches:
+      "true": deep_dive
+      "false": synthesis
+
+  deep_dive:
+    id: deep_dive
+    type: agent
+    model: researcher
+    temperature: 0.3
+    system_prompt: You are a senior analyst closing evidence gaps.
+    prompt_template: |
+      The merged evidence below contains gaps (lines starting with "GAP:").
+      For each gap: either resolve it with the strongest available
+      reasoning and say how confident you are, or explicitly mark it
+      "UNRESOLVED" with the reason. Under 100 words, plain text.
+
+      Merged evidence:
+      {{ nodes.evidence_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  synthesis:
+    id: synthesis
+    type: agent
+    model: writer
+    temperature: 0.4
+    system_prompt: You are the strategist writing the synthesis of a market study.
+    prompt_template: |
+      Synthesize the merged evidence into a synthesis memo: the market
+      picture in three sentences, the competitive opening, and the customer
+      wedge. Do not invent facts beyond the evidence. Under 120 words,
+      plain text.
+
+      Scope:
+      {{ nodes.scope.output }}
+
+      Merged evidence:
+      {{ nodes.evidence_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: review
+  exec_review:
+    id: exec_review
+    type: human_in_loop
+    prompt: "Synthesis ready. Approve for the final brief, or type corrections (Enter to submit)."
+    timeout_seconds: 300
+
+  # Phase: delivery
+  final_brief:
+    id: final_brief
+    type: agent
+    model: writer
+    temperature: 0.4
+    system_prompt: You write one-page executive briefs that survive the meeting.
+    prompt_template: |
+      Produce the final one-page brief (under 150 words, plain text):
+      recommendation up front, then the evidence behind it, then the top
+      risk and its mitigation. Incorporate the executive's corrections.
+
+      Synthesis:
+      {{ nodes.synthesis.output }}
+
+      Executive corrections:
+      {{ nodes.exec_review.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  brief_header:
+    id: brief_header
+    type: tool_call
+    tool_name: upper
+    arguments_template: '{"text": "Q4 Planning Brief: Orchestrator ICP Positioning"}'
+
+  delivery_pack:
+    id: delivery_pack
+    type: agent
+    model: writer
+    temperature: 0.3
+    system_prompt: You prepare the final delivery pack for a board-level review.
+    prompt_template: |
+      Assemble the delivery pack, plain text, in order: HEADER (use the
+      provided uppercase header), BRIEF (the final brief), and a two-line
+      DISTRIBUTION note (who gets it, by when, and the one question each
+      reader should answer).
+
+      Header:
+      {{ nodes.brief_header.output }}
+
+      Final brief:
+      {{ nodes.final_brief.output }}
+
+      Executive review outcome:
+      {{ nodes.exec_review.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+edges:
+  - from_id: scope
+    to_id: research_fanout
+  - from_id: research_fanout
+    to_id: market_scan
+  - from_id: research_fanout
+    to_id: competitor_scan
+  - from_id: research_fanout
+    to_id: customer_voice
+  - from_id: market_scan
+    to_id: evidence_merge
+  - from_id: competitor_scan
+    to_id: evidence_merge
+  - from_id: customer_voice
+    to_id: evidence_merge
+  - from_id: evidence_merge
+    to_id: coverage_gate
+  - from_id: coverage_gate
+    to_id: deep_dive
+    condition_label: "true"
+  - from_id: coverage_gate
+    to_id: synthesis
+    condition_label: "false"
+  - from_id: deep_dive
+    to_id: synthesis
+  - from_id: synthesis
+    to_id: exec_review
+  - from_id: exec_review
+    to_id: final_brief
+  - from_id: final_brief
+    to_id: brief_header
+  - from_id: brief_header
+    to_id: delivery_pack

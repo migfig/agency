@@ -1,0 +1,41 @@
+# sandbox_smoke — spec 006 quickstart demo (tool-only; no model server required).
+# Run: uv run agency workflows/sandbox_smoke.yaml            (sandbox, the default)
+#      uv run agency workflows/sandbox_smoke.yaml --environment local
+#
+# Every node exits 0: the denials are *observed inside* the sandbox and
+# reported to stdout, so the run completes (exit 0) while still proving the
+# isolation (contract §5/§6/§7):
+#   capture       stdout + stderr captured in the standard result shape
+#   out_of_bounds a write outside /scratch is denied (read-only rootfs);
+#                 /etc/agency-pwn must never appear on the host
+#   network       egress is blocked (network_mode="none")
+#   artifact      write_file output is the retrievable host artifact path
+#                 (runs/<run_id>/sandbox/<execution-uuid>/smoke.txt)
+name: sandbox_smoke
+entry_point: capture
+execution_environment: sandbox
+nodes:
+  capture:
+    id: capture
+    type: tool_call
+    tool_name: shell
+    arguments_template: '{"command": "echo stdout-captured && echo stderr-captured >&2"}'
+  out_of_bounds:
+    id: out_of_bounds
+    type: tool_call
+    tool_name: shell
+    arguments_template: '{"command": "if touch /etc/agency-pwn 2>/dev/null; then echo OOB-WRITE-POSSIBLE; else echo OOB-WRITE-DENIED; fi"}'
+  network:
+    id: network
+    type: tool_call
+    tool_name: shell
+    arguments_template: '{"command": "timeout 3 bash -c ''exec 3<>/dev/tcp/1.1.1.1/53'' 2>/dev/null && echo NET-EGRESS-OPEN || echo NET-EGRESS-BLOCKED"}'
+  artifact:
+    id: artifact
+    type: tool_call
+    tool_name: write_file
+    arguments_template: '{"path": "smoke.txt", "content": "sandbox smoke artifact\n"}'
+edges:
+  - {from_id: capture, to_id: out_of_bounds}
+  - {from_id: out_of_bounds, to_id: network}
+  - {from_id: network, to_id: artifact}

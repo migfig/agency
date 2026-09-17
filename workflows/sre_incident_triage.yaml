@@ -1,0 +1,136 @@
+name: sre-incident-triage
+entry_point: intake
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: intake
+    name: Intake
+    node_ids: [intake]
+  - id: route
+    name: Routing
+    node_ids: [severity_gate, page_oncall, log_incident, escalation_merge]
+  - id: ack
+    name: On-Call Acknowledgment
+    node_ids: [oncall_ack]
+
+nodes:
+  # Phase: intake
+  intake:
+    id: intake
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: >
+      You are the intake classifier for an SRE on-call pipeline.
+      Be concise and factual.
+    prompt_template: |
+      Classify the following incident report. Reply in exactly two lines:
+      1. The severity on its own line: P1, P2, P3, or P4
+      2. One sentence summarizing the incident and its blast radius.
+      Do not mention any other severity level in the summary.
+
+      Incident INC-20931 (service: checkout-api, region: eu-west-1)
+      "Checkout latency p99 jumped from 400ms to 9s at 02:14 UTC.
+      Error rate on /v1/charge is 12%. Roughly 8% of paying customers
+      are affected. Suspected DB connection pool exhaustion after
+      the 02:00 deploy."
+    retry:
+      max_attempts: 3
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: route
+  severity_gate:
+    id: severity_gate
+    type: conditional
+    condition: "{{ nodes.intake.output }} contains P1"
+    branches:
+      "true": page_oncall
+      "false": log_incident
+
+  page_oncall:
+    id: page_oncall
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the senior on-call engineer drafting a P1 escalation page.
+    prompt_template: |
+      Draft the escalation page for this incident. Keep it under 90 words:
+      what is broken, who is affected, the suspected cause, and the first
+      three runbook steps. Plain text, no headers.
+
+      Intake summary:
+      {{ nodes.intake.output }}
+    retry:
+      max_attempts: 3
+      base_delay_seconds: 0.5
+      max_delay_seconds: 5
+      timeout_seconds: 120
+    fallback: fb_page
+
+  log_incident:
+    id: log_incident
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the incident logger for a SaaS on-call team.
+    prompt_template: |
+      Write a runbook log entry for this incident: what happened, current
+      status, and the follow-up ticket to file. Under 70 words, plain text.
+
+      Intake summary:
+      {{ nodes.intake.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  escalation_merge:
+    id: escalation_merge
+    type: merge
+    strategy: any
+    inputs: [page_oncall, log_incident]
+
+  # Standby: fallback agent for page_oncall.
+  # No in/out edges, not the entry point -> never launched by the DAG.
+  fb_page:
+    id: fb_page
+    type: agent
+    model: draft
+    temperature: 0.1
+    system_prompt: You are the on-call engineer of last resort.
+    prompt_template: |
+      The primary escalation agent failed. Draft a minimal safe page:
+      acknowledge the incident, state that an engineer is investigating,
+      and point to the runbook. Do not invent details.
+
+      Intake summary:
+      {{ nodes.intake.output }}
+
+  # Phase: ack
+  oncall_ack:
+    id: oncall_ack
+    type: human_in_loop
+    prompt: "Incident routed. Acknowledge the page and note any immediate action (Enter to confirm)."
+    timeout_seconds: 300
+
+edges:
+  - from_id: intake
+    to_id: severity_gate
+  - from_id: severity_gate
+    to_id: page_oncall
+    condition_label: "true"
+  - from_id: severity_gate
+    to_id: log_incident
+    condition_label: "false"
+  - from_id: page_oncall
+    to_id: escalation_merge
+  - from_id: log_incident
+    to_id: escalation_merge
+  - from_id: escalation_merge
+    to_id: oncall_ack

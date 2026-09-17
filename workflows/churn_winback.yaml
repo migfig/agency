@@ -1,0 +1,193 @@
+name: churn-winback
+entry_point: account_intake
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: intake
+    name: Account Intake
+    node_ids: [account_intake]
+  - id: route
+    name: Risk Routing
+    node_ids: [risk_gate]
+  - id: draft
+    name: Campaign Draft
+    node_ids: [offer_winback, nurture, campaign_merge]
+  - id: review
+    name: Compliance and Approval
+    node_ids: [sanitize_fanout, subject_case, compliance_check, campaign_approval]
+  - id: finalize
+    name: Finalize
+    node_ids: [campaign_final]
+
+nodes:
+  # Phase: intake
+  account_intake:
+    id: account_intake
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: You are the churn analyst for a B2B SaaS company.
+    prompt_template: |
+      Assess churn risk for this account. Reply in exactly two lines:
+      1. Either "high risk" or "low risk" (lowercase, exactly that
+         phrase) on its own line.
+      2. One sentence with the two strongest signals.
+
+      Account: Meridian Labs (Pro plan, 14 seats)
+      - MTD usage: down 38% vs trailing 3-month average
+      - Last support ticket: 6 weeks ago, unresolved
+      - Renewal: in 30 days; contract value $4,200/yr
+      - Champion engineer left the company last month
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: route
+  risk_gate:
+    id: risk_gate
+    type: conditional
+    condition: "{{ nodes.account_intake.output }} contains high risk"
+    branches:
+      "true": offer_winback
+      "false": nurture
+
+  # Phase: draft
+  offer_winback:
+    id: offer_winback
+    type: agent
+    model: draft
+    temperature: 0.4
+    system_prompt: You are a retention specialist who writes direct, uncheesy email.
+    prompt_template: |
+      Draft a winback email (under 100 words) for this account. Acknowledge
+      the specific signals, make one concrete offer, and ask for a 15-minute
+      call. Plain text.
+
+      Risk assessment:
+      {{ nodes.account_intake.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  nurture:
+    id: nurture
+    type: agent
+    model: draft
+    temperature: 0.4
+    system_prompt: You write short, low-pressure nurture emails for a B2B SaaS.
+    prompt_template: |
+      Draft a light nurture email (under 60 words) for this account: one
+      useful product tip and one link to relevant docs. No discount, no
+      urgency. Plain text.
+
+      Risk assessment:
+      {{ nodes.account_intake.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  campaign_merge:
+    id: campaign_merge
+    type: merge
+    strategy: any
+    inputs: [offer_winback, nurture]
+
+  # Phase: review
+  sanitize_fanout:
+    id: sanitize_fanout
+    type: broadcast
+    targets: [subject_case, compliance_check]
+
+  subject_case:
+    id: subject_case
+    type: tool_call
+    tool_name: upper
+    arguments_template: '{"text": "subject: a better 30 days for meridian labs"}'
+
+  compliance_check:
+    id: compliance_check
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: You are the compliance reviewer for outbound marketing email.
+    prompt_template: |
+      Check this draft against: no unverified claims, no pricing promises
+      outside policy, no dark patterns, and a working unsubscribe notice.
+      Reply with at most three bullet lines of findings, then a final
+      line: "CLEAR" or "CHANGES NEEDED".
+
+      Draft:
+      {{ nodes.campaign_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  campaign_approval:
+    id: campaign_approval
+    type: human_in_loop
+    prompt: "Compliance reviewed. Approve the campaign for send? (type 'approve' or a note, then Enter)"
+    timeout_seconds: 300
+
+  # Phase: finalize
+  campaign_final:
+    id: campaign_final
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the lifecycle marketing lead producing the final send file.
+    prompt_template: |
+      Produce the final campaign package, plain text, in order:
+      SUBJECT (use the provided uppercase subject), then BODY (the draft,
+      corrected per the compliance findings and approval notes), then a
+      one-line AUDIT note summarizing the compliance outcome and approval.
+
+      Subject:
+      {{ nodes.subject_case.output }}
+
+      Draft:
+      {{ nodes.campaign_merge.output }}
+
+      Compliance findings:
+      {{ nodes.compliance_check.output }}
+
+      Approval notes:
+      {{ nodes.campaign_approval.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+edges:
+  - from_id: account_intake
+    to_id: risk_gate
+  - from_id: risk_gate
+    to_id: offer_winback
+    condition_label: "true"
+  - from_id: risk_gate
+    to_id: nurture
+    condition_label: "false"
+  - from_id: offer_winback
+    to_id: campaign_merge
+  - from_id: nurture
+    to_id: campaign_merge
+  - from_id: campaign_merge
+    to_id: sanitize_fanout
+  - from_id: sanitize_fanout
+    to_id: subject_case
+  - from_id: sanitize_fanout
+    to_id: compliance_check
+  - from_id: subject_case
+    to_id: campaign_approval
+  - from_id: compliance_check
+    to_id: campaign_final
+  - from_id: campaign_approval
+    to_id: campaign_final

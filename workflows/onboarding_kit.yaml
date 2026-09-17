@@ -1,0 +1,141 @@
+name: onboarding-kit
+entry_point: role_profile
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: profile
+    name: Role Profile
+    node_ids: [role_profile]
+  - id: docs
+    name: Kit Documents
+    node_ids: [doc_fanout, access_checklist, first_week_plan]
+  - id: review
+    name: Manager Review
+    node_ids: [manager_review]
+  - id: delivery
+    name: Delivery
+    node_ids: [final_kit]
+
+nodes:
+  # Phase: profile
+  role_profile:
+    id: role_profile
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the onboarding program manager.
+    prompt_template: |
+      Write a four-line role profile from this job description: the
+      mission in one line, the two main dependencies (teams/tools), the
+      definition of done for the first 90 days, and one skill the hire
+      should be stretched on.
+
+      Role: Platform Engineer, Infrastructure team
+      JD excerpt: "Own the local-LLM serving stack (llama.cpp fleet on
+      shared GPU boxes). Build and maintain the model registry, VRAM
+      scheduler, and provisioning pass for the agent workflow platform.
+      You will pair with SRE on capacity planning and with product on
+      developer ergonomics. We expect you to write design docs people
+      actually read."
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: docs
+  doc_fanout:
+    id: doc_fanout
+    type: broadcast
+    targets: [access_checklist, first_week_plan]
+
+  access_checklist:
+    id: access_checklist
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You write precise, checkbox-ready provisioning checklists.
+    prompt_template: |
+      Write the access and provisioning checklist for this role: at most
+      eight lines, each starting with "- [ ] ", covering accounts,
+      repositories, GPU box access, on-call read access, and secrets
+      vault scope. No prose.
+
+      Role profile:
+      {{ nodes.role_profile.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  first_week_plan:
+    id: first_week_plan
+    type: agent
+    model: draft
+    temperature: 0.4
+    system_prompt: You build realistic first-week plans that respect the hire's time.
+    prompt_template: |
+      Write the first-week plan for this role: one line per day, Monday
+      to Friday. Mix reading, pairing, and one small shipped change by
+      Friday. At most ten lines, plain text.
+
+      Role profile:
+      {{ nodes.role_profile.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: review
+  manager_review:
+    id: manager_review
+    type: human_in_loop
+    prompt: "Kit drafted. Approve it, or type the corrections for the final kit (Enter to submit)."
+    timeout_seconds: 300
+
+  # Phase: delivery
+  final_kit:
+    id: final_kit
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You assemble the final onboarding kit for the hiring manager.
+    prompt_template: |
+      Assemble the final onboarding kit, plain text, in order: ROLE
+      PROFILE, ACCESS CHECKLIST, FIRST WEEK PLAN, and a one-line MANAGER
+      NOTE summarizing the review outcome. Apply the manager's corrections
+      where they conflict.
+
+      Role profile:
+      {{ nodes.role_profile.output }}
+
+      Access checklist:
+      {{ nodes.access_checklist.output }}
+
+      First week plan:
+      {{ nodes.first_week_plan.output }}
+
+      Manager review:
+      {{ nodes.manager_review.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+edges:
+  - from_id: role_profile
+    to_id: doc_fanout
+  - from_id: doc_fanout
+    to_id: access_checklist
+  - from_id: doc_fanout
+    to_id: first_week_plan
+  - from_id: access_checklist
+    to_id: manager_review
+  - from_id: first_week_plan
+    to_id: manager_review
+  - from_id: manager_review
+    to_id: final_kit

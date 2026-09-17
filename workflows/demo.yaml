@@ -1,0 +1,16 @@
+name: demo
+entry_point: upper
+nodes:
+  upper:
+    id: upper
+    type: tool_call
+    tool_name: upper
+    arguments_template: '{"text": "hello"}'
+  approve:
+    id: approve
+    type: human_in_loop
+    prompt: "Approve? (y/n)"
+    timeout_seconds: 300
+edges:
+  - from_id: upper
+    to_id: approve

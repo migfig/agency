@@ -1,0 +1,215 @@
+name: support-ticket-pipeline
+entry_point: intake
+vram_limit: 16GB
+context_window: 1024
+summarize_threshold: 25
+summarizer_model: draft
+
+models:
+  draft:
+    endpoint: http://127.0.0.1:8100
+    path: gemma-4-e2b-it-Q8_0.gguf
+    vram_size: 8GB
+
+phases:
+  - id: intake
+    name: Intake
+    node_ids: [intake]
+  - id: triage
+    name: Triage
+    node_ids: [triage]
+  - id: resolution
+    name: Resolution
+    node_ids: [refund_resolution, general_resolution, resolution_merge]
+  - id: review
+    name: Routing and Review
+    node_ids: [sanitization_fanout, route_tag, route_label, supervisor_review]
+  - id: finalize
+    name: Finalize
+    node_ids: [final_merge, final_report]
+
+nodes:
+  # Phase: intake
+  intake:
+    id: intake
+    type: agent
+    model: draft
+    temperature: 0.2
+    system_prompt: >
+      You are the intake classifier for a SaaS customer support desk.
+      Be concise and factual.
+    prompt_template: |
+      Classify the following support ticket. Reply in exactly two lines:
+      1. One lowercase word from: billing, refund, technical, other
+      2. One sentence summarizing the customer's request.
+
+      Ticket #48213 (customer: Meridian Labs, plan: Pro)
+      "I requested a refund for the March invoice two weeks ago
+      (invoice INV-3320) and it is still not processed. My manager
+      needs this resolved before Friday — please confirm the
+      refund status and date."
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+
+  # Phase: triage
+  triage:
+    id: triage
+    type: conditional
+    condition: "{{ nodes.intake.output }} contains refund"
+    branches:
+      "true": refund_resolution
+      "false": general_resolution
+
+  # Phase: resolution (diamond)
+  refund_resolution:
+    id: refund_resolution
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are a senior billing support agent for a SaaS company.
+    prompt_template: |
+      Draft a concise, empathetic reply to the customer confirming that their
+      refund request is being processed, the expected window (5-7 business
+      days back to the original payment method), and a direct escalation
+      contact for their Friday deadline. Plain text, no headers.
+
+      Intake summary:
+      {{ nodes.intake.output }}
+    retry:
+      max_attempts: 3
+      base_delay_seconds: 0.5
+      max_delay_seconds: 5
+      timeout_seconds: 120
+    fallback: fb_agent
+
+  general_resolution:
+    id: general_resolution
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are a support agent for a SaaS company.
+    prompt_template: |
+      Draft a concise, empathetic reply to the customer acknowledging their
+      request, stating what will happen next, and giving a follow-up
+      timeframe. Plain text, no headers.
+
+      Intake summary:
+      {{ nodes.intake.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+    fallback: fb_agent
+
+  resolution_merge:
+    id: resolution_merge
+    type: merge
+    strategy: any
+    inputs: [refund_resolution, general_resolution]
+
+  # Standby: fallback agent for every agent/tool that can fail.
+  # No in/out edges, not the entry point -> never launched by the DAG.
+  fb_agent:
+    id: fb_agent
+    type: agent
+    model: draft
+    temperature: 0.1
+    system_prompt: You are the support agent of last resort.
+    prompt_template: |
+      A primary agent failed mid-run. Draft a safe, generic reply ack
+      nowing the customer's request and promising a follow-up within one
+      business day. Do not invent policy details.
+
+      Intake summary:
+      {{ nodes.intake.output }}
+
+  # Phase: review (fan-out + fan-in)
+  sanitization_fanout:
+    id: sanitization_fanout
+    type: broadcast
+    targets: [route_tag, supervisor_review]
+
+  route_tag:
+    id: route_tag
+    type: tool_call
+    tool_name: replace
+    arguments_template: '{"text": "{{ nodes.triage.output }}", "old": "true", "new": "refund"}'
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+
+  route_label:
+    id: route_label
+    type: tool_call
+    tool_name: replace
+    arguments_template: '{"text": "{{ nodes.route_tag.output }}", "old": "false", "new": "general"}'
+    fallback: fb_agent
+
+  supervisor_review:
+    id: supervisor_review
+    type: human_in_loop
+    prompt: "Route tagged. Approve the reply for the customer? (type 'approve' or a note, then Enter)"
+    timeout_seconds: 30
+
+  # Phase: finalize
+  final_merge:
+    id: final_merge
+    type: merge
+    strategy: all
+    inputs: [route_label, supervisor_review]
+
+  final_report:
+    id: final_report
+    type: agent
+    model: draft
+    temperature: 0.3
+    system_prompt: You are the lead support agent drafting the final outbound message.
+    prompt_template: |
+      Compose the final outbound reply to the customer. Combine the
+      resolution draft with the routing and review notes. Keep it under
+      120 words, plain text, and end with the route tag on its own line
+      prefixed with "route:".
+
+      Intake summary:
+      {{ nodes.intake.output }}
+
+      Resolution draft:
+      {{ nodes.resolution_merge.output }}
+
+      Routing and review:
+      {{ nodes.final_merge.output }}
+    retry:
+      max_attempts: 2
+      base_delay_seconds: 0.5
+      timeout_seconds: 120
+    fallback: fb_agent
+
+edges:
+  - from_id: intake
+    to_id: triage
+  - from_id: triage
+    to_id: refund_resolution
+    condition_label: "true"
+  - from_id: triage
+    to_id: general_resolution
+    condition_label: "false"
+  - from_id: refund_resolution
+    to_id: resolution_merge
+  - from_id: general_resolution
+    to_id: resolution_merge
+  - from_id: resolution_merge
+    to_id: sanitization_fanout
+  - from_id: sanitization_fanout
+    to_id: route_tag
+  - from_id: sanitization_fanout
+    to_id: supervisor_review
+  - from_id: route_tag
+    to_id: route_label
+  - from_id: route_label
+    to_id: final_merge
+  - from_id: supervisor_review
+    to_id: final_merge
+  - from_id: final_merge
+    to_id: final_report
